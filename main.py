@@ -1,89 +1,99 @@
 from flask import Flask, jsonify
 import requests
+from bs4 import BeautifulSoup # Necesaria para "leer" la página del BCV
+import urllib3
+
+# Desactivamos la advertencia de seguridad porque el certificado del BCV es malo
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-# --- FUNCIÓN PARA CONSULTAR BINANCE P2P DIRECTAMENTE ---
-def obtener_precio_binance():
+def obtener_euro_bcv_directo():
     try:
-        url = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
-        
-        # Le decimos a Binance que queremos COMPRAR (BUY) USDT pagando con VES (Bolívares)
-        # Filtramos por "Pago Móvil" (transferencia bancaria) que es lo más común
-        payload = {
-            "asset": "USDT",
-            "fiat": "VES",
-            "merchantCheck": False,
-            "page": 1,
-            "publisherType": None,
-            "rows": 10,
-            "tradeType": "BUY",
-            "transAmount": "500" # Simulamos comprar 500 Bs para ver precios reales
-        }
-        
+        # 1. Entramos a la página oficial del BCV
+        # IMPORTANTE: verify=False es el secreto para que no falle por SSL
+        url = "https://www.bcv.org.ve"
         headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Content-Type": "application/json"
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         }
         
-        response = requests.post(url, json=payload, headers=headers, timeout=5)
-        data = response.json()
+        response = requests.get(url, headers=headers, verify=False, timeout=10)
         
-        # Obtenemos los anuncios de la respuesta
-        anuncios = data['data']
+        # 2. Buscamos el div que tiene el ID "euro"
+        soup = BeautifulSoup(response.content, 'html.parser')
+        euro_div = soup.find('div', {'id': 'euro'})
         
-        # Calculamos el promedio de los primeros 5 precios para evitar estafas o precios falsos
-        suma = 0.0
-        cantidad = 0
-        for i in range(min(5, len(anuncios))):
-            precio = float(anuncios[i]['adv']['price'])
-            suma += precio
-            cantidad += 1
-            
-        promedio = suma / cantidad
-        return promedio
+        # 3. Limpiamos el texto (El BCV pone comas en vez de puntos)
+        texto_tasa = euro_div.find('strong').text.strip()
+        tasa_limpia = texto_tasa.replace(',', '.')
+        
+        return float(tasa_limpia)
 
     except Exception as e:
-        print(f"Error Binance: {e}")
-        return None
+        print(f"Error raspando BCV: {e}")
+        return 0.0 # Si falla, devolveremos 0 para usar el cálculo de respaldo
 
-# --- FUNCIÓN DE RESPALDO (DOLARAPI) ---
-def obtener_respaldo():
+# --- TU FUNCIÓN DE BINANCE (LA QUE YA TIENES) ---
+def obtener_precio_binance():
+    # ... (Pega aquí tu código de Binance que ya funcionaba) ...
+    # (Por espacio no lo repito, pero déjalo tal cual)
     try:
-        oficial = requests.get("https://ve.dolarapi.com/v1/dolares/oficial").json()["promedio"]
-        paralelo = requests.get("https://ve.dolarapi.com/v1/dolares/paralelo").json()["promedio"]
-        return oficial, paralelo
+        url = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
+        payload = {
+            "asset": "USDT", "fiat": "VES", "merchantCheck": False, "page": 1,
+            "publisherType": None, "rows": 10, "tradeType": "BUY", "transAmount": "500"
+        }
+        headers = {"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"}
+        response = requests.post(url, json=payload, headers=headers, timeout=5)
+        anuncios = response.json()['data']
+        suma = 0.0
+        for i in range(min(5, len(anuncios))):
+            suma += float(anuncios[i]['adv']['price'])
+        return suma / min(5, len(anuncios))
     except:
-        return 0.0, 0.0
+        return 0.0
 
 @app.route('/tasas')
 def tasas():
-    # 1. Intentamos obtener el precio REAL de Binance
+    # 1. Intentamos las fuentes PRO (Binance + BCV Directo)
     precio_usdt = obtener_precio_binance()
+    precio_euro_bcv = obtener_euro_bcv_directo()
     
-    # 2. Obtenemos el oficial y respaldo por si acaso
-    oficial, paralelo_backup = obtener_respaldo()
-    
-    # Si Binance falló (nos bloquearon), usamos el paralelo de respaldo
-    if precio_usdt is None or precio_usdt == 0:
-        precio_usdt = paralelo_backup
-        fuente_usdt = "DolarApi (Respaldo)"
-    else:
-        fuente_usdt = "Binance P2P (En vivo)"
-
-    # 3. Calculamos Euro (Matemático)
+    # 2. Respaldo (DolarApi) por si acaso
     try:
-        euro_mundial = requests.get("https://open.er-api.com/v6/latest/EUR").json()["rates"]["USD"]
-        precio_euro = oficial * euro_mundial
+        oficial = requests.get("https://ve.dolarapi.com/v1/dolares/oficial").json()["promedio"]
     except:
-        precio_euro = 0.0
+        oficial = 0.0
+
+    # Lógica del Euro: Si logramos raspar el BCV, usamos ese. Si no, calculamos.
+    if precio_euro_bcv > 0:
+        euro_final = precio_euro_bcv
+        fuente_euro = "BCV Directo"
+    else:
+        # Cálculo matemático de respaldo
+        try:
+            factor = requests.get("https://open.er-api.com/v6/latest/EUR").json()["rates"]["USD"]
+            euro_final = oficial * factor
+            fuente_euro = "Calculado (Backup)"
+        except:
+            euro_final = 0.0
+
+    # Lógica del USDT
+    if precio_usdt > 0:
+        usdt_final = precio_usdt
+        fuente_usdt = "Binance P2P"
+    else:
+        # Si falla Binance, usamos el paralelo de API
+        try:
+            usdt_final = requests.get("https://ve.dolarapi.com/v1/dolares/paralelo").json()["promedio"]
+            fuente_usdt = "API (Respaldo)"
+        except:
+            usdt_final = 0.0
 
     return jsonify({
         "oficial": oficial,
-        "paralelo": precio_usdt, # Aquí mandamos el de Binance real
-        "euro": precio_euro,
-        "fuente": fuente_usdt
+        "paralelo": usdt_final,
+        "euro": euro_final,
+        "fuente_usdt": fuente_usdt,
+        "fuente_euro": fuente_euro
     })
-
-if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
