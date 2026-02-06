@@ -7,22 +7,20 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-# --- FUNCIÓN AUXILIAR PARA CONSULTAR UN LADO (COMPRA O VENTA) ---
+# --- FUNCIÓN 1: BINANCE (P2P / PARALELO) ---
 def consultar_binance(tipo_orden):
     try:
         url = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
         
-        # tradeType "BUY" = Anuncios de gente vendiendo (Tú compras)
-        # tradeType "SELL" = Anuncios de gente comprando (Tú vendes)
         payload = {
             "asset": "USDT",
             "fiat": "VES",
             "merchantCheck": False,
             "page": 1,
             "publisherType": None,
-            "rows": 50,       
+            "rows": 100,        
             "tradeType": tipo_orden, 
-            "transAmount": "500"     # Filtro de 500 Bs para precios "de calle"
+            "transAmount": "500"     
         }
         
         headers = {
@@ -32,16 +30,13 @@ def consultar_binance(tipo_orden):
         
         response = requests.post(url, json=payload, headers=headers, timeout=5)
         data = response.json()
-        
         anuncios = data['data']
         
-        if not anuncios:
-            return 0.0
+        if not anuncios: return 0.0
 
         suma = 0.0
         cantidad = 0
         
-        # Promediamos todos los resultados que encontramos (hasta 20)
         for anuncio in anuncios:
             precio = float(anuncio['adv']['price'])
             suma += precio
@@ -53,72 +48,102 @@ def consultar_binance(tipo_orden):
         print(f"Error en {tipo_orden}: {e}")
         return 0.0
 
-# --- FUNCIÓN PRINCIPAL QUE UNE TODO ---
 def obtener_promedio_mercado():
-    # 1. Obtenemos el precio de venta (A cómo comprar dólares)
     promedio_venta_usdt = consultar_binance("BUY")
-    
-    # 2. Obtenemos el precio de compra (A cómo vender dólares)
     promedio_compra_usdt = consultar_binance("SELL")
     
-    # 3. Calculamos el promedio justo entre los dos
     if promedio_venta_usdt > 0 and promedio_compra_usdt > 0:
-        promedio_final = (promedio_venta_usdt + promedio_compra_usdt) / 2
-        return promedio_final
+        return (promedio_venta_usdt + promedio_compra_usdt) / 2
     elif promedio_venta_usdt > 0:
-        return promedio_venta_usdt # Si falla uno, usamos el otro
+        return promedio_venta_usdt
     else:
-        return 0.0 # Si fallan los dos
+        return 0.0
 
-# --- SCRAPING BCV (IGUAL QUE ANTES) ---
-def obtener_euro_bcv_directo():
+# --- FUNCIÓN 2: SCRAPING BCV (DOLAR Y EURO JUNTOS) ---
+def obtener_tasas_bcv():
+    # Diccionario para guardar resultados. Si falla, quedan en 0.0
+    resultados = {"dolar": 0.0, "euro": 0.0}
+    
     try:
         url = "https://www.bcv.org.ve"
-        headers = {'User-Agent': 'Mozilla/5.0'}
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+        
+        # Hacemos UNA sola petición para no saturar al BCV
         response = requests.get(url, headers=headers, verify=False, timeout=10)
         soup = BeautifulSoup(response.content, 'html.parser')
-        euro_div = soup.find('div', {'id': 'euro'})
-        texto_tasa = euro_div.find('strong').text.strip()
-        return float(texto_tasa.replace(',', '.'))
-    except:
-        return 0.0
+        
+        # 1. Buscar Dólar (id="dolar")
+        div_dolar = soup.find('div', {'id': 'dolar'})
+        if div_dolar:
+            texto = div_dolar.find('strong').text.strip()
+            resultados["dolar"] = float(texto.replace(',', '.'))
+            
+        # 2. Buscar Euro (id="euro")
+        div_euro = soup.find('div', {'id': 'euro'})
+        if div_euro:
+            texto = div_euro.find('strong').text.strip()
+            resultados["euro"] = float(texto.replace(',', '.'))
+
+        return resultados
+
+    except Exception as e:
+        print(f"Error raspando BCV: {e}")
+        return resultados # Devuelve ceros si falla
 
 @app.route('/tasas')
 def tasas():
-    # DATOS PRO (Binance Promedio + BCV)
-    precio_usdt = obtener_promedio_mercado()
-    precio_euro_bcv = obtener_euro_bcv_directo()
+    # 1. Obtener tasas del BCV (Página Oficial)
+    tasas_bcv = obtener_tasas_bcv()
+    oficial_bcv = tasas_bcv["dolar"]
+    euro_bcv = tasas_bcv["euro"]
+
+    # 2. Obtener tasas de Binance (Mercado)
+    paralelo_binance = obtener_promedio_mercado()
     
-    # RESPALDO (DolarApi)
+    # 3. Datos de Respaldo (DolarApi) por si el scraping falla
     try:
-        oficial = requests.get("https://ve.dolarapi.com/v1/dolares/oficial").json()["promedio"]
+        datos_api = requests.get("https://ve.dolarapi.com/v1/dolares/oficial").json()
+        oficial_api = datos_api["promedio"]
     except:
-        oficial = 0.0
+        oficial_api = 0.0
 
-    # LÓGICA DE RESPUESTA
-    if precio_usdt > 0:
-        usdt_final = precio_usdt
-        fuente_usdt = "Binance (Promedio Compra/Venta)"
+    # --- LÓGICA DE SELECCIÓN FINAL ---
+
+    # A. Dólar Oficial: Preferimos scraping BCV, si falla (da 0), usamos API
+    if oficial_bcv > 0:
+        tasa_oficial_final = oficial_bcv
+    else:
+        tasa_oficial_final = oficial_api
+
+    # B. Dólar Paralelo: Preferimos Binance, si falla, usamos API paralelo
+    if paralelo_binance > 0:
+        tasa_paralela_final = paralelo_binance
+        fuente_usdt = "Binance P2P"
     else:
         try:
-            usdt_final = requests.get("https://ve.dolarapi.com/v1/dolares/paralelo").json()["promedio"]
-            fuente_usdt = "API (Respaldo)"
+            tasa_paralela_final = requests.get("https://ve.dolarapi.com/v1/dolares/paralelo").json()["promedio"]
+            fuente_usdt = "DolarApi (Respaldo)"
         except:
-            usdt_final = 0.0
+            tasa_paralela_final = 0.0
+            fuente_usdt = "Error"
 
-    if precio_euro_bcv > 0:
-        euro_final = precio_euro_bcv
+    # C. Euro: Preferimos scraping BCV, si falla, calculamos matemático
+    if euro_bcv > 0:
+        tasa_euro_final = euro_bcv
     else:
         try:
+            # Cálculo matemático de emergencia
             factor = requests.get("https://open.er-api.com/v6/latest/EUR").json()["rates"]["USD"]
-            euro_final = oficial * factor
+            tasa_euro_final = tasa_oficial_final * factor
         except:
-            euro_final = 0.0
+            tasa_euro_final = 0.0
 
     return jsonify({
-        "oficial": oficial,
-        "paralelo": usdt_final,
-        "euro": euro_final,
+        "oficial": tasa_oficial_final, # Ahora viene directo del BCV
+        "paralelo": tasa_paralela_final,
+        "euro": tasa_euro_final,
         "fuente": fuente_usdt
     })
 
